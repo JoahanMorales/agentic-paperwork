@@ -4,7 +4,7 @@ use actix_web::{
 };
 use chrono::{Datelike, Utc};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -39,24 +39,54 @@ async fn agente_conversacional(
     state: Data<AppState>,
     body: Json<ChatRequest>,
 ) -> Result<impl Responder, ApiError> {
-    let catalogo = catalog_context(&state).await?;
-    let system = "Eres el agente conversacional de PaperMind, una papelería mexicana. Responde en español mexicano, claro y amable. Solo puedes hablar de catálogo, disponibilidad, precios, pedidos y devoluciones. No inventes precios ni descuentos. Si el usuario pide algo fuera de dominio, indica que debe escalarse a humano.";
+    let intencion = detectar_intencion(&body.mensaje);
+    let sentimiento = detectar_sentimiento(&body.mensaje);
+    let (catalogo, productos_sugeridos) = relevant_products_context(&state, &body.mensaje).await?;
+    let cliente_context = customer_context(&state, body.cliente_id).await?;
+    let pedido_context = order_context_from_message(&state, &body.mensaje).await?;
+
+    let system = r#"Eres PaperMind IA, el agente conversacional oficial de una papelería mexicana.
+Reglas obligatorias:
+- Responde siempre en español mexicano, amable, breve y útil.
+- Usa SOLO la información del catálogo y contexto proporcionados. No inventes precios, stock, descuentos ni políticas.
+- Puedes ayudar con catálogo, disponibilidad, precios, recomendaciones, pedidos, puntos y devoluciones.
+- Si el cliente pide algo fuera del dominio de PaperMind, marca escalado=true.
+- Si el cliente está molesto o hay una devolución compleja, marca escalado=true.
+- Si un producto no tiene stock, ofrece alternativas del catálogo o suscripción de disponibilidad.
+- Devuelve exclusivamente JSON válido, sin markdown, con esta forma:
+{
+  "respuesta": "texto para el cliente",
+  "escalado": false,
+  "motivo_escalado": null,
+  "acciones_sugeridas": ["accion corta"],
+  "productos_mencionados": ["nombre exacto del producto"]
+}
+"#;
+
     let prompt = format!(
-        "Catálogo disponible resumido:\n{catalogo}\n\nMensaje del cliente: {}\n\nDevuelve una respuesta útil y breve. Si requiere humano, inicia con [ESCALAR].",
+        "Intención detectada: {intencion}\nSentimiento detectado: {sentimiento}\n\nContexto del cliente:\n{cliente_context}\n\nContexto de pedido detectado:\n{pedido_context}\n\nProductos relevantes del catálogo:\n{catalogo}\n\nMensaje del cliente:\n{}",
         body.mensaje
     );
-    let respuesta = chat_completion(&state.http, &state.config, system, &prompt).await?;
-    let escalado = respuesta.trim_start().starts_with("[ESCALAR]");
-    let intencion = detectar_intencion(&body.mensaje);
+    let raw_response = chat_completion(&state.http, &state.config, system, &prompt).await?;
+    let parsed = parse_agent_response(&raw_response);
+    let escalado = parsed
+        .get("escalado")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| sentimiento == "frustracion" || intencion == "fuera_dominio");
+    let respuesta = parsed
+        .get("respuesta")
+        .and_then(Value::as_str)
+        .unwrap_or(raw_response.trim());
 
     let interaccion_id: Uuid = sqlx::query(
         "insert into interacciones_agente (cliente_id, canal, consulta_resumen, intencion_detectada, escalado, sentimiento, resuelta, fecha_fin)
-         values ($1,'web',$2,$3,$4,'neutro',$5,now()) returning id",
+         values ($1,'web',$2,$3,$4,$5,$6,now()) returning id",
     )
     .bind(body.cliente_id)
     .bind(body.mensaje.chars().take(240).collect::<String>())
     .bind(intencion)
     .bind(escalado)
+    .bind(sentimiento)
     .bind(!escalado)
     .fetch_one(&state.pool)
     .await?
@@ -65,8 +95,13 @@ async fn agente_conversacional(
     Ok(HttpResponse::Ok().json(json!({
         "interaccion_id": interaccion_id,
         "intencion": intencion,
+        "sentimiento": sentimiento,
         "escalado": escalado,
-        "respuesta": respuesta.replace("[ESCALAR]", "").trim()
+        "motivo_escalado": parsed.get("motivo_escalado").cloned().unwrap_or(Value::Null),
+        "respuesta": respuesta,
+        "acciones_sugeridas": parsed.get("acciones_sugeridas").cloned().unwrap_or_else(|| json!([])),
+        "productos_mencionados": parsed.get("productos_mencionados").cloned().unwrap_or_else(|| json!([])),
+        "productos_sugeridos": productos_sugeridos
     })))
 }
 
@@ -334,42 +369,277 @@ async fn reporte_ventas(
     })))
 }
 
-async fn catalog_context(state: &AppState) -> Result<String, ApiError> {
+async fn relevant_products_context(
+    state: &AppState,
+    message: &str,
+) -> Result<(String, Vec<Value>), ApiError> {
     let rows = sqlx::query(
-        "select nombre, precio_venta, stock_actual, estado
-         from productos where estado <> 'inactivo'
-         order by stock_actual desc limit 25",
+        "select p.id, p.nombre, p.descripcion, p.precio_venta, p.stock_actual, p.estado,
+                coalesce(c.nombre, 'Sin categoría') as categoria
+         from productos p
+         left join categorias c on c.id = p.categoria_id
+         where p.estado <> 'inactivo'
+         order by p.stock_actual desc, p.nombre
+         limit 150",
     )
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(rows
+    let terms = search_terms(message);
+    let mut scored = rows
         .into_iter()
-        .map(|r| {
-            format!(
-                "{} | ${} | stock {} | {}",
-                r.get::<String, _>("nombre"),
-                r.get::<rust_decimal::Decimal, _>("precio_venta"),
-                r.get::<i32, _>("stock_actual"),
-                r.get::<String, _>("estado")
-            )
+        .map(|row| {
+            let name: String = row.get("nombre");
+            let description: Option<String> = row.get("descripcion");
+            let category: String = row.get("categoria");
+            let searchable = format!(
+                "{} {} {}",
+                name.to_lowercase(),
+                description.clone().unwrap_or_default().to_lowercase(),
+                category.to_lowercase()
+            );
+            let score = terms
+                .iter()
+                .filter(|term| searchable.contains(term.as_str()))
+                .count();
+            (score, row, name, description, category)
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    let selected = scored
+        .into_iter()
+        .filter(|(score, _, _, _, _)| terms.is_empty() || *score > 0)
+        .take(12)
+        .collect::<Vec<_>>();
+
+    let products = selected
+        .into_iter()
+        .map(|(_, row, name, description, category)| {
+            let id: Uuid = row.get("id");
+            let price: rust_decimal::Decimal = row.get("precio_venta");
+            let stock: i32 = row.get("stock_actual");
+            let status: String = row.get("estado");
+            json!({
+                "id": id,
+                "nombre": name,
+                "categoria": category,
+                "descripcion": description,
+                "precio_venta": price,
+                "stock_actual": stock,
+                "estado": status
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let context = if products.is_empty() {
+        "No se encontraron productos relacionados con el mensaje.".to_string()
+    } else {
+        products
+            .iter()
+            .map(|product| {
+                format!(
+                    "- {} | categoría: {} | precio: ${} MXN | stock: {} | estado: {} | id: {}",
+                    product["nombre"].as_str().unwrap_or(""),
+                    product["categoria"].as_str().unwrap_or(""),
+                    product["precio_venta"],
+                    product["stock_actual"],
+                    product["estado"].as_str().unwrap_or(""),
+                    product["id"]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Ok((context, products))
+}
+
+async fn customer_context(state: &AppState, cliente_id: Option<Uuid>) -> Result<String, ApiError> {
+    let Some(cliente_id) = cliente_id else {
+        return Ok("Cliente no identificado.".to_string());
+    };
+
+    let Some(cliente) = sqlx::query(
+        "select nombre, apellido, tipo_perfil, es_cliente_frecuente from clientes where id = $1",
+    )
+    .bind(cliente_id)
+    .fetch_optional(&state.pool)
+    .await?
+    else {
+        return Ok("Cliente enviado no existe en la base.".to_string());
+    };
+
+    let puntos = sqlx::query(
+        "select coalesce(sum(case when tipo = 'acumulacion' then puntos else -puntos end), 0)::int as saldo
+         from transacciones_puntos where cliente_id = $1",
+    )
+    .bind(cliente_id)
+    .fetch_one(&state.pool)
+    .await?
+    .get::<i32, _>("saldo");
+
+    let last_order = sqlx::query(
+        "select id, estado, total, created_at from pedidos where cliente_id = $1 order by created_at desc limit 1",
+    )
+    .bind(cliente_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let order_text = if let Some(order) = last_order {
+        format!(
+            "Último pedido: {} | estado: {} | total: ${} | fecha: {}",
+            order.get::<Uuid, _>("id"),
+            order.get::<String, _>("estado"),
+            order.get::<rust_decimal::Decimal, _>("total"),
+            order.get::<chrono::DateTime<Utc>, _>("created_at")
+        )
+    } else {
+        "Sin pedidos registrados.".to_string()
+    };
+
+    Ok(format!(
+        "Cliente: {} {} | perfil: {} | frecuente: {} | puntos: {}\n{}",
+        cliente.get::<String, _>("nombre"),
+        cliente.get::<String, _>("apellido"),
+        cliente.get::<String, _>("tipo_perfil"),
+        cliente.get::<bool, _>("es_cliente_frecuente"),
+        puntos,
+        order_text
+    ))
+}
+
+async fn order_context_from_message(state: &AppState, message: &str) -> Result<String, ApiError> {
+    let Some(order_id) = extract_uuid(message) else {
+        return Ok("No se detectó UUID de pedido en el mensaje.".to_string());
+    };
+
+    let Some(order) = sqlx::query(
+        "select id, estado, metodo_pago, modalidad_entrega, total, created_at from pedidos where id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(&state.pool)
+    .await?
+    else {
+        return Ok(format!("Se detectó el UUID {order_id}, pero no existe como pedido."));
+    };
+
+    Ok(format!(
+        "Pedido detectado: {} | estado: {} | pago: {} | entrega: {} | total: ${} | fecha: {}",
+        order.get::<Uuid, _>("id"),
+        order.get::<String, _>("estado"),
+        order
+            .get::<Option<String>, _>("metodo_pago")
+            .unwrap_or_else(|| "no registrado".to_string()),
+        order
+            .get::<Option<String>, _>("modalidad_entrega")
+            .unwrap_or_else(|| "no registrada".to_string()),
+        order.get::<rust_decimal::Decimal, _>("total"),
+        order.get::<chrono::DateTime<Utc>, _>("created_at")
+    ))
+}
+
+fn search_terms(message: &str) -> Vec<String> {
+    let stopwords = [
+        "que",
+        "con",
+        "para",
+        "tienen",
+        "tengo",
+        "quiero",
+        "cuanto",
+        "cuesta",
+        "precio",
+        "disponible",
+        "hay",
+        "los",
+        "las",
+        "una",
+        "uno",
+        "del",
+        "por",
+        "favor",
+        "dame",
+        "sobre",
+        "producto",
+        "productos",
+    ];
+
+    message
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() > 2 && !stopwords.contains(word))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn extract_uuid(message: &str) -> Option<Uuid> {
+    message
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '.')
+        .find_map(|piece| Uuid::parse_str(piece.trim()).ok())
+}
+
+fn parse_agent_response(raw: &str) -> Value {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    serde_json::from_str(cleaned).unwrap_or_else(|_| {
+        json!({
+            "respuesta": raw.trim(),
+            "escalado": false,
+            "motivo_escalado": null,
+            "acciones_sugeridas": [],
+            "productos_mencionados": []
+        })
+    })
 }
 
 fn detectar_intencion(mensaje: &str) -> &'static str {
     let lower = mensaje.to_lowercase();
-    if lower.contains("precio") || lower.contains("cuesta") {
+    if lower.contains("precio") || lower.contains("cuesta") || lower.contains("cuestan") {
         "precio"
     } else if lower.contains("stock") || lower.contains("disponible") || lower.contains("hay") {
         "disponibilidad"
-    } else if lower.contains("pedido") || lower.contains("orden") {
+    } else if lower.contains("pedido") || lower.contains("orden") || lower.contains("rastreo") {
         "estado_pedido"
-    } else if lower.contains("devol") || lower.contains("cambio") {
+    } else if lower.contains("devol") || lower.contains("cambio") || lower.contains("reembolso") {
         "devolucion"
+    } else if lower.contains("recomienda") || lower.contains("sugiere") || lower.contains("similar")
+    {
+        "recomendacion"
+    } else if lower.contains("tarea") || lower.contains("examen") || lower.contains("resuelve") {
+        "fuera_dominio"
     } else {
         "general"
+    }
+}
+
+fn detectar_sentimiento(mensaje: &str) -> &'static str {
+    let lower = mensaje.to_lowercase();
+    if [
+        "molesto",
+        "enojado",
+        "pésimo",
+        "pesimo",
+        "mal servicio",
+        "no sirve",
+        "queja",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        "frustracion"
+    } else if ["gracias", "excelente", "perfecto", "genial", "bien"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        "positivo"
+    } else {
+        "neutro"
     }
 }
 

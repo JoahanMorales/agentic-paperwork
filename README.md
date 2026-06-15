@@ -564,6 +564,33 @@ Body:
 }
 ```
 
+Respuesta esperada:
+
+```json
+{
+  "interaccion_id": "uuid",
+  "intencion": "precio",
+  "sentimiento": "neutro",
+  "escalado": false,
+  "motivo_escalado": null,
+  "respuesta": "Sí, tenemos cuadernos disponibles...",
+  "acciones_sugeridas": ["Agregar producto al carrito"],
+  "productos_mencionados": ["Cuaderno profesional cuadro chico 100 hojas"],
+  "productos_sugeridos": [
+    {
+      "id": "uuid",
+      "nombre": "Cuaderno profesional cuadro chico 100 hojas",
+      "categoria": "Cuadernos",
+      "precio_venta": "49.00",
+      "stock_actual": 120,
+      "estado": "activo"
+    }
+  ]
+}
+```
+
+El agente ahora usa productos relevantes según el mensaje, contexto del cliente si se manda `cliente_id`, último pedido del cliente y detección de sentimiento.
+
 Ejemplo fuera de dominio:
 
 ```json

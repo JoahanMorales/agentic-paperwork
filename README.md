@@ -671,6 +671,38 @@ GET {{base_url}}/api/reportes/ventas
 11. `POST /api/agentes/prediccion/ejecutar`
 12. `GET /api/dashboard`
 
+## Keep-alive para Render
+
+Render puede suspender instancias gratuitas después de un periodo sin tráfico. Se incluye un script simple para hacer ping periódico al endpoint `/health`.
+
+Ejecutar con valores por defecto:
+
+```bash
+python scripts/keep_alive.py
+```
+
+Por defecto consulta:
+
+```text
+https://agentic-paperwork.onrender.com/health
+```
+
+Configurar intervalo o URL:
+
+```bash
+KEEP_ALIVE_URL=https://agentic-paperwork.onrender.com/health KEEP_ALIVE_INTERVAL=600 python scripts/keep_alive.py
+```
+
+En Windows PowerShell:
+
+```powershell
+$env:KEEP_ALIVE_URL="https://agentic-paperwork.onrender.com/health"
+$env:KEEP_ALIVE_INTERVAL="600"
+python scripts/keep_alive.py
+```
+
+> Nota: el proceso debe quedarse corriendo en alguna computadora, servidor o servicio de automatización externo. Si cierras la terminal, se detiene.
+
 ## Validación
 
 ```bash

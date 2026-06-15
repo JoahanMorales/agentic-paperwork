@@ -671,6 +671,28 @@ GET {{base_url}}/api/reportes/ventas
 11. `POST /api/agentes/prediccion/ejecutar`
 12. `GET /api/dashboard`
 
+## Seed de productos
+
+Para cargar productos de prueba en el backend desplegado en Render:
+
+```bash
+python scripts/seed_products_api.py
+```
+
+Por defecto usa:
+
+```text
+https://agentic-paperwork.onrender.com
+```
+
+Para apuntar a otra URL:
+
+```bash
+API_BASE_URL=http://127.0.0.1:8080 python scripts/seed_products_api.py
+```
+
+El script crea categorías, proveedor base y productos escolares como cuadernos, lápices, plumas, hojas, carpetas, arte y oficina.
+
 ## Keep-alive para Render
 
 Render puede suspender instancias gratuitas después de un periodo sin tráfico. Se incluye un script simple para hacer ping periódico al endpoint `/health`.

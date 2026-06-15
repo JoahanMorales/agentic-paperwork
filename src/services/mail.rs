@@ -1,4 +1,5 @@
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{config::Config, error::ApiError};
 
@@ -16,7 +17,7 @@ pub async fn send_email(
     to: &str,
     subject: &str,
     html: &str,
-) -> Result<(), ApiError> {
+) -> Result<Value, ApiError> {
     let api_key = config
         .resend_api_key
         .as_deref()
@@ -38,14 +39,16 @@ pub async fn send_email(
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
         return Err(ApiError::ExternalService(format!(
             "Resend respondió {}: {}",
             status, text
         )));
     }
 
-    Ok(())
+    serde_json::from_str(&text)
+        .map_err(|e| ApiError::ExternalService(format!("respuesta inválida de Resend: {e}")))
 }

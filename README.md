@@ -620,6 +620,35 @@ POST {{base_url}}/api/agentes/prediccion/ejecutar
 
 Sin body.
 
+### Enviar correo de prueba
+
+Headers: administrador. Sirve para diagnosticar Resend sin depender de clientes ni de OpenRouter.
+
+```http
+POST {{base_url}}/api/mail/test
+```
+
+Body:
+
+```json
+{
+  "email": "{{email_prueba}}"
+}
+```
+
+Respuesta exitosa:
+
+```json
+{
+  "correo_enviado": true,
+  "resend": {
+    "id": "email_id_de_resend"
+  }
+}
+```
+
+Si Resend rechaza el envío, el backend devuelve el error exacto de Resend.
+
 ### Generar promoción personalizada
 
 Headers: administrador o cajero. Requiere `OPENROUTER_API_KEY`. Envía correo si `RESEND_API_KEY` y `MAIL_FROM` están configurados.
@@ -636,6 +665,8 @@ Body:
   "email": "{{email_prueba}}"
 }
 ```
+
+La respuesta incluye `resend.id` cuando Resend acepta el correo.
 
 ### Configurar parámetro de agente
 

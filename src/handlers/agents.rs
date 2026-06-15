@@ -24,6 +24,7 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
         .service(ejecutar_prediccion)
         .service(configurar_agente)
         .service(generar_promocion)
+        .service(enviar_correo_prueba)
         .service(dashboard)
         .service(reporte_ventas);
 }
@@ -242,6 +243,33 @@ struct PromoRequest {
     email: String,
 }
 
+#[derive(Deserialize)]
+struct TestEmailRequest {
+    email: String,
+}
+
+#[post("/api/mail/test")]
+async fn enviar_correo_prueba(
+    req: HttpRequest,
+    state: Data<AppState>,
+    body: Json<TestEmailRequest>,
+) -> Result<impl Responder, ApiError> {
+    require_admin(&req)?;
+    let resend_response = send_email(
+        &state.http,
+        &state.config,
+        &body.email,
+        "Prueba de correo PaperMind",
+        "<h1>PaperMind</h1><p>Este es un correo de prueba enviado desde el backend en Render.</p>",
+    )
+    .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "correo_enviado": true,
+        "resend": resend_response
+    })))
+}
+
 #[post("/api/agentes/fidelizacion/promocion")]
 async fn generar_promocion(
     req: HttpRequest,
@@ -295,8 +323,9 @@ async fn generar_promocion(
     )
     .await?;
 
+    let mut resend_response = Value::Null;
     if state.config.mail_enabled() {
-        send_email(
+        resend_response = send_email(
             &state.http,
             &state.config,
             &body.email,
@@ -316,6 +345,7 @@ async fn generar_promocion(
     Ok(HttpResponse::Ok().json(json!({
         "cliente_id": body.cliente_id,
         "correo_enviado": state.config.mail_enabled(),
+        "resend": resend_response,
         "contenido": contenido
     })))
 }
